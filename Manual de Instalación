@@ -1,0 +1,58 @@
+# 🛡️ Manual de Instalación: StarPulse Ultra
+**Prototipo de Autenticación Biométrica Avanzada (CISO)**
+
+Este manual describe los pasos necesarios para configurar el entorno, instalar las dependencias y ejecutar tanto el servidor de seguridad como el cliente de verificación biométrica.
+
+---
+
+## 1. Requisitos Previos
+
+Antes de comenzar, asegúrese de cumplir con lo siguiente:
+*   **Sistema Operativo:** Windows (Recomendado para compatibilidad con MediaPipe y OpenCV).
+*   **Hardware:** Cámara web funcional (necesaria para el escaneo facial) .
+*   **Lenguaje:** [Python 3.10 o 3.11](https://www.python.org/downloads/) recomendado.
+
+---
+
+## 2. Configuración del Entorno Virtual
+
+Es fundamental aislar las dependencias para evitar conflictos.
+
+1.  Abra una terminal en la carpeta raíz `Prototipo_CISO`.
+2.  Cree el entorno virtual:
+    ```powershell
+    python -m venv venv311
+    ```
+3.  Active el entorno virtual:
+    *   **PowerShell:** `.\venv311\Scripts\Activate.ps1`
+    *   **CMD:** `.\venv311\Scripts\activate`
+
+---
+
+## 3. Instalación de Dependencias
+
+Con el entorno virtual activo, ejecute:
+
+```powershell
+pip install -r requirements.txt
+```
+
+---
+
+## 4. Ejecución del Sistema
+
+### Paso A: Iniciar el Servidor (API)
+1.  Navegue a: `src/server`
+2.  Ejecute: `python app.py`
+
+### Paso B: Iniciar el Cliente
+1.  Navegue a: `src/client`
+2.  Ejecute: `python main.py`
+
+---
+
+## 5. Guía de Uso Rápido
+
+1.  **Registro:** Opción [1]. Siga las instrucciones visuales de parpadeo y poses.
+2.  **Acceso:** Opción [2]. Complete el reto de vivacidad activo (tocar cara con dedo índice).
+3.  **Seguridad:** 3 fallos resultan en un bloqueo de 30 segundos.
