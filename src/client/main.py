@@ -40,7 +40,7 @@ ILUMINACION_MIN    = 60     # Brillo mínimo promedio (0-255) — muy oscuro = r
 ILUMINACION_MAX    = 220    # Brillo máximo promedio — sobreexpuesto = rechazar
 FRONTAL_MARGEN     = 0.35   # Rango amplio para considerar cara frontal (35%–65%)
 
-FRAMES_REQUERIDOS   = 10
+FRAMES_REQUERIDOS   = 12
 
 # ─────────────────────────────────────────────
 #  Umbrales de Identidad — v2 (CORREGIDOS)
@@ -63,7 +63,7 @@ SPOOF_TEXTURA_MIN_LAP  = 8.0      # Varianza mínima de textura (más tolerante)
 # Reto de vivacidad activo: el usuario debe completar UN gesto aleatorio antes
 # de pasar al gate de identidad. Tiempo límite en segundos.
 SPOOF_RETO_TIMEOUT_SEG = 15       # Tiempo máximo para completar el reto activo
-MAX_ERRORES_VIVACIDAD  = 15       # Umbral máximo de errores antes del bloqueo
+MAX_ERRORES_VIVACIDAD  = 3        # Umbral MUY estricto de errores antes del bloqueo (anti video)
 
 # ─────────────────────────────────────────────
 #  UI — Accesibilidad (adultos mayores)
@@ -146,8 +146,12 @@ def check_bloqueo(nombre):
     if not estado:
         return False, 0.0
     ahora = time.time()
-    if estado["bloqueado_hasta"] and ahora < estado["bloqueado_hasta"]:
-        return True, estado["bloqueado_hasta"] - ahora
+    if estado["bloqueado_hasta"]:
+        if ahora < estado["bloqueado_hasta"]:
+            return True, estado["bloqueado_hasta"] - ahora
+        else:
+            estado["count"] = 0
+            estado["bloqueado_hasta"] = 0.0
     return False, 0.0
 
 def registrar_fallo(nombre):
@@ -158,7 +162,6 @@ def registrar_fallo(nombre):
     print(f" [SEGURIDAD] Fallo #{count} para '{nombre}'.")
     if count >= MAX_INTENTOS_LOGIN:
         _intentos_fallidos[nombre]["bloqueado_hasta"] = time.time() + COOLDOWN_SEGUNDOS
-        _intentos_fallidos[nombre]["count"] = 0
         return True
     return False
 
@@ -877,6 +880,7 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
         errores_acumulados = 0
         frames_cumplidos = 0
         frames_fail_id   = 0
+        frames_en_este_reto = 0
         exito_final      = False
         fp_ref           = np.array(fingerprint_esperado, dtype=float)
 
@@ -946,11 +950,11 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
 
                     # Timeout: reiniciar con reto nuevo
                     if anti_spoof.tiempo_restante <= 0:
-                        registrar_fallo(nombre)
+                        is_locked = registrar_fallo(nombre)
                         fail_count = _intentos_fallidos[nombre]["count"]
                         intentos_rest = MAX_INTENTOS_LOGIN - fail_count
                         
-                        if fail_count >= MAX_INTENTOS_LOGIN:
+                        if is_locked:
                             mensaje_camara(frame, f"SISTEMA BLOQUEADO ({COOLDOWN_SEGUNDOS}s)", (0, 0, 255), 3000)
                             cap.release()
                             cv2.destroyAllWindows()
@@ -997,23 +1001,40 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                                          155, color=(80, 80, 255), escala=0.60)
 
                         if frames_fail_id >= MAX_FRAMES_RECHAZO:
-                            registrar_fallo(nombre)
+                            is_locked = registrar_fallo(nombre)
                             fail_count = _intentos_fallidos[nombre]["count"]
                             intentos_rest = MAX_INTENTOS_LOGIN - fail_count
                             msg = (f"BLOQUEADO {COOLDOWN_SEGUNDOS}s" 
-                                   if fail_count >= MAX_INTENTOS_LOGIN
+                                   if is_locked
                                    else f"ACCESO DENEGADO - {intentos_rest} INTENTOS REST")
                             mensaje_camara(frame, msg, (0, 0, 180), 3000)
                             break
                         
                 elif fase_login == "RETOS":
+                    frames_en_este_reto += 1
                     reto = retos_actuales[paso_reto]
-                    put_texto_grande(frame, f"PASO {paso_reto+1}/{len(retos_actuales)}:", 110, color=(255, 200, 0))
+                    tiempo_rest_seg = max(0, (150 - frames_en_este_reto) // 30)
+                    put_texto_grande(frame, f"PASO {paso_reto+1}/{len(retos_actuales)} ({tiempo_rest_seg}s):", 110, color=(255, 200, 0))
                     put_texto_grande(frame, reto["label"], 155, color=(0, 255, 0))
                     if reto["arrow"]:
                         draw_arrow(frame, reto["arrow"])
                     if "id_punto" in reto:
                         dibujar_objetivo_tactil(frame, face_lm, reto["id_punto"])
+
+                    if frames_en_este_reto > 150:
+                        is_locked = registrar_fallo(nombre)
+                        fail_count = _intentos_fallidos[nombre]["count"]
+                        intentos_rest = MAX_INTENTOS_LOGIN - fail_count
+                        if is_locked:
+                            mensaje_camara(frame, f"SISTEMA BLOQUEADO ({COOLDOWN_SEGUNDOS}s)", (0, 0, 255), 3000)
+                            cap.release()
+                            cv2.destroyAllWindows()
+                            return False, None
+                        else:
+                            mensaje_camara(frame, f"TIEMPO AGOTADO - {intentos_rest} INTENTOS REST", (0, 100, 255), 2000)
+                            frames_en_este_reto = 0
+                            errores_acumulados = 0
+                            continue
 
                     condiciones = reto["cond"]
                     # 2. VALIDACIÓN NEGATIVA ESTRICTA (El Bloqueo)
@@ -1043,11 +1064,12 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                     if errores_acumulados >= MAX_ERRORES_VIVACIDAD:
                         errores_acumulados = 0
                         frames_cumplidos = 0
-                        registrar_fallo(nombre)
+                        frames_en_este_reto = 0
+                        is_locked = registrar_fallo(nombre)
                         fail_count = _intentos_fallidos[nombre]["count"]
                         intentos_rest = MAX_INTENTOS_LOGIN - fail_count
                         
-                        if fail_count >= MAX_INTENTOS_LOGIN:
+                        if is_locked:
                             print("[SEGURIDAD] Demasiados errores de posición. Posible video detectado.")
                             mensaje_camara(frame, "ERROR VIVACIDAD: ACCESO DENEGADO", (0, 0, 255), 3000)
                             cap.release()
@@ -1071,10 +1093,10 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                         
                         # Si otra persona intenta hacer el reto y falla repetidas veces la similitud relajada:
                         if frames_fail_reto >= 90:  # ~3 intentos largos o ~3 segundos de fraude detectado
-                            registrar_fallo(nombre)
+                            is_locked = registrar_fallo(nombre)
                             fail_count = _intentos_fallidos[nombre]["count"]
                             intentos_rest = MAX_INTENTOS_LOGIN - fail_count
-                            if fail_count >= MAX_INTENTOS_LOGIN:
+                            if is_locked:
                                 mensaje_camara(frame, f"SISTEMA BLOQUEADO ({COOLDOWN_SEGUNDOS}s)", (0, 0, 200), 3000)
                             else:
                                 mensaje_camara(frame, f"FRAUDE DETECTADO - {intentos_rest} INTENTOS REST", (0, 0, 200), 2000)
@@ -1117,6 +1139,7 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                     if frames_cumplidos >= FRAMES_REQUERIDOS:
                         paso_reto       += 1
                         frames_cumplidos = 0
+                        frames_en_este_reto = 0
                         blink_estado_seg = "abierto"
 
                         if paso_reto < len(retos_actuales):
