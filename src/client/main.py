@@ -29,7 +29,7 @@ URL = "http://127.0.0.1:5000"
 # ─────────────────────────────────────────────
 #  Umbrales Biométricos
 # ─────────────────────────────────────────────
-EAR_UMBRAL      = 0.025  # Subido: detects natural blinks without keeping eye fully closed
+EAR_UMBRAL      = 0.18   # EAR matemático (Ojo abierto ~0.30, Ojo cerrado <0.20)
 BOCA_UMBRAL     = 0.16
 GIRO_DER_UMBRAL = 0.05
 GIRO_IZQ_UMBRAL = 0.05
@@ -48,7 +48,8 @@ FRAMES_REQUERIDOS   = 10
 # Debido a que los humanos compartimos proporciones faciales parecidas, la similitud del
 # coseno suele estar por arriba del 95% incluso entre dos personas distintas.
 # Exigimos un 98% para el Gate en tiempo real y 99% para la validación final.
-SIMILITUD_GATE      = 0.978  # Gate en tiempo real
+SIMILITUD_GATE      = 0.978  # Gate inicial en posición neutral
+SIMILITUD_RELAJADA  = 0.93   # Tolerancia durante gestos faciales (la cara se deforma al sonreír/girar)
 SIMILITUD_GATE_DURO = 0.988  # Validación final estricta
 MAX_FRAMES_RECHAZO  = 25     # Frames de rechazo antes de contar un fallo
 
@@ -62,6 +63,7 @@ SPOOF_TEXTURA_MIN_LAP  = 8.0      # Varianza mínima de textura (más tolerante)
 # Reto de vivacidad activo: el usuario debe completar UN gesto aleatorio antes
 # de pasar al gate de identidad. Tiempo límite en segundos.
 SPOOF_RETO_TIMEOUT_SEG = 15       # Tiempo máximo para completar el reto activo
+MAX_ERRORES_VIVACIDAD  = 15       # Umbral máximo de errores antes del bloqueo
 
 # ─────────────────────────────────────────────
 #  UI — Accesibilidad (adultos mayores)
@@ -239,21 +241,49 @@ def get_face_fingerprint(landmarks):
 
     return fp
 
+def calcular_ear(p, indices):
+    """ Calcula el Eye Aspect Ratio real matemático """
+    p_h1, p_h2 = p[indices[0]], p[indices[1]]
+    p_v1_t, p_v1_b = p[indices[2]], p[indices[3]]
+    p_v2_t, p_v2_b = p[indices[4]], p[indices[5]]
+
+    dist_h  = ((p_h1.x - p_h2.x)**2 + (p_h1.y - p_h2.y)**2)**0.5
+    dist_v1 = ((p_v1_t.x - p_v1_b.x)**2 + (p_v1_t.y - p_v1_b.y)**2)**0.5
+    dist_v2 = ((p_v2_t.x - p_v2_b.x)**2 + (p_v2_t.y - p_v2_b.y)**2)**0.5
+
+    if dist_h < 1e-6:
+        return 0.0
+    return (dist_v1 + dist_v2) / (2.0 * dist_h)
+
 def es_frontal(landmarks):
     """
-    True si la nariz está en el rango central del ancho de la cara.
-    Usa FRONTAL_MARGEN (default 35%-65%) — más amplio que antes (40%-60%)
-    para no rechazar caras válidas por micro-movimientos.
+    Verifica que la cara esté alineada en el eje X (sin girar lateralmente)
+    y en el eje Y (sin mirar hacia arriba o abajo).
     """
     p     = landmarks
-    nariz = p[1].x
-    izq   = p[234].x
-    der   = p[454].x
-    ancho = der - izq
+    nariz = p[1]
+    izq   = p[234]
+    der   = p[454]
+    ancho = der.x - izq.x
     if ancho < 1e-6:
         return False
-    relativo = (nariz - izq) / ancho
-    return FRONTAL_MARGEN < relativo < (1.0 - FRONTAL_MARGEN)
+    
+    # Inclinación lateral (Eje X)
+    relativo_x = (nariz.x - izq.x) / ancho
+    es_frontal_x = FRONTAL_MARGEN < relativo_x < (1.0 - FRONTAL_MARGEN)
+
+    # Inclinación vertical (Eje Y) - Pitch
+    ojo_y    = (p[33].y + p[263].y) / 2.0
+    menton_y = p[152].y
+    alto     = menton_y - ojo_y
+    if alto < 1e-6:
+        return False
+    
+    relativo_y = (nariz.y - ojo_y) / alto
+    # En una cara normal sin pitch, la nariz está aprox a 35%-60% del alto entre ojos y mentón
+    es_frontal_y = 0.35 < relativo_y < 0.65
+
+    return es_frontal_x and es_frontal_y
 
 def evaluar_iluminacion(frame):
     """
@@ -273,102 +303,65 @@ def calcular_borrosidad(frame):
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 # ─────────────────────────────────────────────
-#  Anti-Spoofing — Reto Activo Aleatorio
+#  Anti-Spoofing — Reto de Oclusión Aleatoria
 # ─────────────────────────────────────────────
-# Lista de retos posibles. Se sortea UNO al iniciar cada sesión de login.
-# Un video pre-grabado no puede predecir cuál se va a pedir.
-RETOS_VIVACIDAD = [
-    {"id": "parpadeo",  "label": "PARPADEE AHORA",       "cond": "parpadeo",  "arrow": None},
-    {"id": "sonrisa",   "label": "SONRIA AHORA",          "cond": "sonrisa",   "arrow": None},
-    {"id": "giro_izq",  "label": "GIRE A LA IZQUIERDA",  "cond": "giro_izq",  "arrow": "IZQUIERDA"},
-    {"id": "giro_der",  "label": "GIRE A LA DERECHA",    "cond": "giro_der",  "arrow": "DERECHA"},
-    {"id": "arriba",    "label": "MIRE HACIA ARRIBA",    "cond": "arriba",    "arrow": "ARRIBA"},
-    {"id": "abajo",     "label": "MIRE HACIA ABAJO",     "cond": "abajo",     "arrow": "ABAJO"},
-]
+UMBRAL_PROXIMIDAD = 0.05 # Distancia de proximidad entre dedo y cara (normalizada 0-1)
+
+# Puntos de la cara (MediaPipe Indices)
+PUNTOS_CARA = {
+    "forehead": {"id": 10, "label": "LA FRENTE"},
+    "nose": {"id": 1, "label": "LA PUNTA DE LA NARIZ"},
+    "cheek_right": {"id": 234, "label": "SU MEJILLA DERECHA"},
+    "cheek_left": {"id": 454, "label": "SU MEJILLA IZQUIERDA"}
+}
 
 class AntiSpoofingActivo:
-    """
-    Detección de vivacidad mediante RETO ACTIVO ALEATORIO.
-
-    Estrategia principal: sortear un gesto al iniciar el login y mostrarlo
-    en pantalla justo entonces. Un video pre-grabado NO puede prepararse para
-    un reto que se decide en tiempo real.
-
-    Secundario: verificar textura de piel en zona nasal (rechaza fotos impresas).
-    """
     def __init__(self):
-        # Sortear reto aleatorio
-        self.reto          = random.choice(RETOS_VIVACIDAD)
-        self.superado      = False
-        self.frames_reto   = 0          # frames consecutivos que cumplen el reto
-        self.inicio_ts     = time.time()
-        self.alerta        = ""
-        self.blink_estado  = "abierto"
-        self.blink_frames  = 0
-        print(f" [ANTISPOOF] Reto activo sorteado: '{self.reto['id']}'")
+        # Sortea un punto de la cara al azar
+        self.id_punto_reto, self.datos_punto = random.choice(list(PUNTOS_CARA.items()))
+        self.superado = False
+        self.inicio_ts = time.time()
+        self.alerta = ""
+        # Definimos el dedo índice como el puntero (id 8)
+        self.id_dedo_puntero = 8 
+        print(f" [ANTISPOOF] Reto de oclusión sorteado: {self.datos_punto['label']}")
 
     @property
     def tiempo_restante(self):
         return max(0.0, SPOOF_RETO_TIMEOUT_SEG - (time.time() - self.inicio_ts))
 
-    def analizar(self, frame, face_lm, acciones):
-        """
-        Retorna (superado: bool, alerta: str).
-        superado=True una vez que el usuario completa el reto.
-        Después de superado, ya no bloquea.
-        """
+    def analizar(self, frame, face_lm, res_hands):
         if self.superado:
             return True, ""
 
-        pts = face_lm.landmark
+        p_face = face_lm.landmark
+        h_face, w_face = frame.shape[:2]
 
-        # ── Check secundario: textura de piel (foto impresa muy borrosa) ──
-        h, w = frame.shape[:2]
-        nx = int(pts[1].x * w)
-        ny = int(pts[1].y * h)
-        mg = 35
-        roi = frame[max(0,ny-mg):min(h,ny+mg), max(0,nx-mg):min(w,nx+mg)]
-        if roi.size > 0:
-            lap = calcular_borrosidad(roi)
-            if lap < SPOOF_TEXTURA_MIN_LAP:
-                self.alerta = "IMAGEN PLANA DETECTADA — USE SU CARA REAL"
-                return False, self.alerta
+        # 1. Obtener el punto de la cara que el usuario debe tocar
+        reto_facial = p_face[self.datos_punto["id"]]
+        reto_facial_xy = np.array([reto_facial.x, reto_facial.y])
 
-        # ── Check principal: reto activo ──
-        cond = self.reto["cond"]
-        cumple = acciones.get(cond, False)
+        # 2. Verificar si hay manos en pantalla
+        if res_hands and res_hands.multi_hand_landmarks:
+            hand_lm = res_hands.multi_hand_landmarks[0]
+            # Usamos el dedo índice (id 8) como puntero
+            p_dedo_xy = np.array([hand_lm.landmark[self.id_dedo_puntero].x, 
+                                 hand_lm.landmark[self.id_dedo_puntero].y])
 
-        if cond == "parpadeo":
-            if self.blink_estado == "abierto" and cumple:
-                self.blink_estado = "cerrado"
-                self.blink_frames = 0
-            elif self.blink_estado == "cerrado":
-                if cumple:
-                    self.blink_frames += 1
-                else:
-                    if self.blink_frames >= 1:
-                        self.superado = True
-                        print(f" [ANTISPOOF] Reto 'parpadeo' superado.")
-                        return True, ""
-                    self.blink_estado = "abierto"
-        else:
-            if cumple:
-                self.frames_reto += 1
-            else:
-                self.frames_reto = 0
+            # 3. Calcular la distancia de proximidad (Euclidiana)
+            distancia = np.linalg.norm(reto_facial_xy - p_dedo_xy)
 
-            # 8 frames consecutivos cumpliendo el reto = superado
-            if self.frames_reto >= 8:
+            # 4. Verificación
+            if distancia < UMBRAL_PROXIMIDAD:
                 self.superado = True
-                print(f" [ANTISPOOF] Reto '{self.reto['id']}' superado.")
+                print(f" [ANTISPOOF] Reto {self.id_punto_reto} verificado.")
                 return True, ""
 
-        # Timeout: no completó el reto a tiempo
+        # Timeout
         if self.tiempo_restante <= 0:
             self.alerta = "TIEMPO AGOTADO — REINICIANDO"
             return False, self.alerta
 
-        self.alerta = ""
         return False, ""
 
     def reset(self):
@@ -408,15 +401,21 @@ def detectar_acciones(face_landmarks, hand_landmarks=None):
     acciones = {
         "parpadeo": False, "sonrisa": False, "giro_der": False,
         "giro_izq": False, "arriba": False, "abajo": False,
-        "interferencia": False,
-        "dedos": 0, "mano_zona": None
+        "interferencia": False, "dedos": 0, "mano_zona": None,
+        "toca_frente": False, "toca_nariz": False,
+        "toca_mejilla_der": False, "toca_mejilla_izq": False
     }
     if not face_landmarks:
         return acciones
     pts = face_landmarks.landmark
 
-    if abs(pts[159].y - pts[145].y) < EAR_UMBRAL:
+    # 1. PARPADEO con EAR Real Matemático
+    ear_izq = calcular_ear(pts, [33, 133, 159, 145, 158, 153])
+    ear_der = calcular_ear(pts, [362, 263, 386, 374, 385, 373])
+    ear_promedio = (ear_izq + ear_der) / 2.0
+    if ear_promedio < EAR_UMBRAL:
         acciones["parpadeo"] = True
+        
     if abs(pts[61].x - pts[291].x) > BOCA_UMBRAL:
         acciones["sonrisa"] = True
 
@@ -428,21 +427,36 @@ def detectar_acciones(face_landmarks, hand_landmarks=None):
 
     frente = pts[10]
     menton = pts[152]
-    if nariz.y < frente.y + ARRIBA_UMBRAL:
+    alto_cara = menton.y - frente.y
+    dist_nariz_frente = nariz.y - frente.y
+    dist_nariz_menton = menton.y - nariz.y
+    
+    if dist_nariz_frente < (alto_cara * 0.45):
         acciones["arriba"] = True
-    if nariz.y > menton.y - (menton.y - frente.y) * ABAJO_FACTOR:
+    if dist_nariz_menton < (alto_cara * 0.35):
         acciones["abajo"] = True
 
     if hand_landmarks:
         acciones["dedos"] = contar_dedos(hand_landmarks.landmark)
-        # Reto anti-deepfake (manos sobre la cara)
-        h_x = hand_landmarks.landmark[0].x
-        f_izq = pts[234].x
-        f_der = pts[454].x
-        # Rango con 5% extra para ser flexibles
-        if min(f_izq, f_der) - 0.05 < h_x < max(f_izq, f_der) + 0.05:
-            if acciones["dedos"] >= 3:
-                acciones["interferencia"] = True
+        if acciones["dedos"] >= 3:
+            acciones["interferencia"] = True
+            
+        # Puntero: Dedo Índice (Landmark 8)
+        dedo_x = hand_landmarks.landmark[8].x
+        dedo_y = hand_landmarks.landmark[8].y
+        
+        # Función auxiliar para proximidad (umbral 6% de pantalla aprox)
+        def cerca(f_idx):
+            fx = pts[f_idx].x
+            fy = pts[f_idx].y
+            return ((fx - dedo_x)**2 + (fy - dedo_y)**2)**0.5 < 0.06
+
+        # Verificación Táctil (Oclusión guiada)
+        if cerca(10):  acciones["toca_frente"] = True
+        if cerca(1):   acciones["toca_nariz"] = True
+        if cerca(234): acciones["toca_mejilla_der"] = True
+        if cerca(454): acciones["toca_mejilla_izq"] = True
+
     return acciones
 
 # ─────────────────────────────────────────────
@@ -496,6 +510,17 @@ def draw_target_zone(frame, zona):
     elif zona == "ABAJO":
         cv2.rectangle(frame, (w//2 - 100, h - 180), (w//2 + 100, h - 20), color, 2)
         cv2.putText(frame, "MANO AQUI", (w//2 - 80, h - 190), 1, 1, color, 1)
+
+def dibujar_objetivo_tactil(frame, face_lm, id_punto):
+    # Obtener coordenadas del landmark de la cara (ej: nariz)
+    pt = face_lm.landmark[id_punto]
+    h, w = frame.shape[:2]
+    cx, cy = int(pt.x * w), int(pt.y * h)
+    
+    # Dibujar un círculo donde el usuario debe poner el dedo
+    cv2.circle(frame, (cx, cy), 20, (0, 255, 255), 2)
+    cv2.putText(frame, "PONGA SU DEDO AQUI", (cx + 25, cy), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
 def cuenta_regresiva(cap, mensaje, segundos=3):
     start = time.time()
@@ -631,7 +656,18 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
 
                 if paso_actual < len(POSES_REGISTRO):
                     pose       = POSES_REGISTRO[paso_actual]
-                    cumple_pose= all(acciones[c] for c in pose["cond"])
+                    condiciones = pose["cond"]
+                    cumple_pose= all(acciones[c] for c in condiciones)
+
+                    # 2. VALIDACIÓN NEGATIVA (Sin bloqueo durante el registro)
+                    gestos_erroneos = ["giro_der", "giro_izq", "arriba", "abajo", "sonrisa"]
+                    for gesto in gestos_erroneos:
+                        if gesto not in condiciones and acciones[gesto]:
+                            put_texto_grande(frame, "MOVIMIENTO INCORRECTO", 100, (0,0,255), 0.6)
+
+                    # 3. Interferencia (Solo advertencia visual en registro)
+                    if acciones["interferencia"]:
+                        put_texto_grande(frame, "POR FAVOR, NO OCLUYA LA CAMARA", 140, (0,150,255), 0.6)
 
                     if pose["id"] == "blink":
                         # Detectar CICLO de parpadeo independientemente de cumple_pose
@@ -644,7 +680,7 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                                 blink_frames_cerrado += 1
                             else:
                                 # Ojo abrió de nuevo → ciclo completo
-                                if blink_frames_cerrado >= 1:
+                                if blink_frames_cerrado >= 3:
                                     blink_ciclos += 1
                                     print(f" Parpadeo #{blink_ciclos} ({blink_frames_cerrado} frames)")
                                 blink_estado = "abierto"
@@ -816,10 +852,17 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
     else:
         # Retos de seguridad: SOLO gestos faciales aleatorios.
         # Sin manos — evita confusión y ataques donde otra persona pone la mano.
+        tactil_random = random.choice([
+            {"id": "toca_frente",  "label": "TOQUE SU FRENTE CON UN DEDO",      "cond": ["toca_frente"],  "arrow": None, "id_punto": 10},
+            {"id": "toca_nariz",   "label": "TOQUE SU NARIZ CON UN DEDO",       "cond": ["toca_nariz"],   "arrow": None, "id_punto": 1},
+            {"id": "toca_m_der",   "label": "TOQUE EL LADO DERECHO DE SU CARA", "cond": ["toca_mejilla_der"], "arrow": None, "id_punto": 234},
+            {"id": "toca_m_izq",   "label": "TOQUE EL LADO IZQUIERDO DE SU CARA","cond": ["toca_mejilla_izq"], "arrow": None, "id_punto": 454},
+        ])
+
         POOL_RETOS = [
             {"id": "parpadeo", "label": "PARPADEE",               "cond": ["parpadeo"],            "arrow": None},
             {"id": "sonrisa",  "label": "SONRIA AMPLIO",          "cond": ["sonrisa"],             "arrow": None},
-            {"id": "manos",    "label": "PASE 3 DEDOS SOBRE SU CARA", "cond": ["interferencia"],   "arrow": None},
+            tactil_random,
             {"id": "giro_izq", "label": "GIRE A LA IZQUIERDA",    "cond": ["giro_izq"],            "arrow": "IZQUIERDA"},
             {"id": "giro_der", "label": "GIRE A LA DERECHA",      "cond": ["giro_der"],            "arrow": "DERECHA"},
             {"id": "arriba",   "label": "MIRE HACIA ARRIBA",      "cond": ["arriba"],              "arrow": "ARRIBA"},
@@ -828,6 +871,7 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
 
         retos_actuales   = random.sample(POOL_RETOS, 3)
         paso_reto        = 0
+        errores_acumulados = 0
         frames_cumplidos = 0
         frames_fail_id   = 0
         exito_final      = False
@@ -841,9 +885,12 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
         blink_frames_seg = 0
 
         # Reto activo de vivacidad — sorteado aquí, justo antes de abrir cámara
-
         anti_spoof = AntiSpoofingActivo()
-        print(f" [LOGIN] Reto vivacidad: {anti_spoof.reto['label']}")
+        print(f" [LOGIN] Reto vivacidad: {anti_spoof.datos_punto['label']}")
+
+        # Variables de la máquina de estados
+        fase_login       = "GATE_INICIAL"
+        frames_fail_reto = 0
 
         cuenta_regresiva(cap, "INICIANDO VERIFICACION BIOMETRICA")
 
@@ -863,26 +910,36 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
 
             if res_face.multi_face_landmarks:
                 face_lm  = res_face.multi_face_landmarks[0]
-                acciones = detectar_acciones(face_lm)   # sin manos
+                hand_lm  = res_hands.multi_hand_landmarks[0] if res_hands.multi_hand_landmarks else None
+                acciones = detectar_acciones(face_lm, hand_lm)
+
+                # >>> SIEMPRE DIBUJAR INDICADORES VISUALES (OJOS, BOCA, NARIZ) <<<
+                indices_mostrar = [33, 133, 159, 145, 362, 263, 386, 374, # Ojos
+                                   61, 291, 13, 14, 78, 308, 12, 15,      # Boca
+                                   1, 4]                                  # Nariz
+                for idx in indices_mostrar:
+                    vx = int(face_lm.landmark[idx].x * w)
+                    vy = int(face_lm.landmark[idx].y * h)
+                    cv2.circle(frame, (vx, vy), 2, (0, 255, 255), -1)
 
                 # ══════════════════════════
                 #  RETO ACTIVO DE VIVACIDAD (PRIMERO)
                 # ══════════════════════════
-                spoof_ok, spoof_alerta = anti_spoof.analizar(frame, face_lm, acciones)
+                spoof_ok, spoof_alerta = anti_spoof.analizar(frame, face_lm, res_hands)
                 mostrar_indicador_antispoof(
                     frame, spoof_ok,
                     anti_spoof.tiempo_restante,
-                    anti_spoof.reto["label"],
+                    anti_spoof.datos_punto["label"],
                     spoof_alerta
                 )
 
                 if not spoof_ok:
                     # Mostrar el reto en pantalla de forma prominente
                     put_texto_grande(frame, "PRUEBA DE VIVACIDAD:", 110, color=(255, 200, 0))
-                    put_texto_grande(frame, anti_spoof.reto["label"],
+                    put_texto_grande(frame, f"TOQUE {anti_spoof.datos_punto['label']} CON SU DEDO",
                                      155, color=(0, 255, 255))
-                    if anti_spoof.reto["arrow"]:
-                        draw_arrow(frame, anti_spoof.reto["arrow"])
+                    
+                    dibujar_objetivo_tactil(frame, face_lm, anti_spoof.datos_punto["id"])
 
                     # Timeout: reiniciar con reto nuevo
                     if anti_spoof.tiempo_restante <= 0:
@@ -897,90 +954,108 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                     continue  # no pasa al gate hasta superar el reto
 
                 # ══════════════════════════
-                #  GATE DE IDENTIDAD
+                #  MÁQUINA DE ESTADOS (LOGICA)
                 # ══════════════════════════
                 frontal    = es_frontal(face_lm.landmark)
                 current_fp = get_face_fingerprint(face_lm.landmark)
 
-                # Validar iluminacion — si es mala, pausar y avisar sin penalizar
-                luz_ok, luz_msg, brillo = evaluar_iluminacion(frame)
-                if not luz_ok:
-                    put_texto_grande(frame, luz_msg, 110, color=(0, 140, 255))
-                    put_texto_grande(frame, "AJUSTE LA ILUMINACION PARA CONTINUAR",
-                                     155, color=(0, 140, 255), escala=0.60)
-                    cv2.imshow("StarPulse Ultra", frame)
-                    cv2.waitKey(1)
-                    continue  # No penaliza, solo espera
+                if fase_login == "GATE_INICIAL":
+                    # Validar iluminacion
+                    luz_ok, luz_msg, brillo = evaluar_iluminacion(frame)
+                    if not luz_ok:
+                        put_texto_grande(frame, luz_msg, 110, color=(0, 140, 255))
+                        cv2.imshow("StarPulse Ultra", frame)
+                        cv2.waitKey(1)
+                        continue
 
-                if frontal:
-                    # Solo calcular similitud cuando la cara esta de frente
-                    ultima_sim = cosine_similarity(current_fp, fp_ref)
-                    print(f" [DEBUG] sim={ultima_sim*100:.2f}%  frontal=True  fail={frames_fail_id}")
+                    if not frontal:
+                        put_texto_grande(frame, "MIRE DE FRENTE A LA CAMARA", 110, color=(0, 210, 255))
+                        cv2.imshow("StarPulse Ultra", frame)
+                        cv2.waitKey(1)
+                        continue
 
-                sim = ultima_sim
-                mostrar_indicador_identidad(frame, sim, SIMILITUD_GATE)
+                    sim = cosine_similarity(current_fp, fp_ref)
+                    mostrar_indicador_identidad(frame, sim, SIMILITUD_GATE)
 
-                # ── FIREWALL DE IDENTIDAD ──
-                if frontal and sim < SIMILITUD_GATE:
-                    frames_fail_id  += 1
-                    frames_cumplidos = 0
+                    if sim >= SIMILITUD_GATE:
+                        fase_login = "RETOS"
+                        frames_fail_id = 0
+                    else:
+                        frames_fail_id += 1
+                        put_texto_grande(frame, "ROSTRO NO RECONOCIDO", 110, color=(0, 0, 255))
+                        put_texto_grande(frame, f"Similitud: {sim*100:.1f}% (Req: {SIMILITUD_GATE*100:.0f}%)",
+                                         155, color=(80, 80, 255), escala=0.60)
 
-                    put_texto_grande(frame, "ROSTRO NO RECONOCIDO", 110, color=(0, 0, 255))
-                    put_texto_grande(frame,
-                        f"Coincidencia: {sim*100:.1f}%  (necesita {SIMILITUD_GATE*100:.0f}%)",
-                        155, color=(80, 80, 255), escala=0.60)
-
-                    if frames_fail_id >= MAX_FRAMES_RECHAZO:
-                        bloqueado = registrar_fallo(nombre)
-                        if bloqueado:
-                            msg = f"BLOQUEADO {COOLDOWN_SEGUNDOS}s — DEMASIADOS INTENTOS"
-                            print(f" [SEGURIDAD] {nombre} bloqueado.")
-                        else:
-                            cnt = _intentos_fallidos.get(nombre, {}).get("count", 0)
-                            msg = f"ACCESO DENEGADO"
-                            print(f" [SEGURIDAD] Gate fallido. Restantes: {MAX_INTENTOS_LOGIN - cnt}")
-                        mensaje_camara(frame, msg, (0, 0, 180), 3500)
-                        break
-
-                    cv2.imshow("StarPulse Ultra", frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
-                    continue  # NO avanza a los retos
-
-                # Identidad valida
-                if frontal and sim >= SIMILITUD_GATE:
-                    frames_fail_id = 0
-
-                # ══════════════════════════
-                #  RETOS DE SEGURIDAD (solo cara)
-                # ══════════════════════════
-                if paso_reto < len(retos_actuales):
+                        if frames_fail_id >= MAX_FRAMES_RECHAZO:
+                            bloqueado = registrar_fallo(nombre)
+                            msg = f"BLOQUEADO {COOLDOWN_SEGUNDOS}s" if bloqueado else "ACCESO DENEGADO"
+                            mensaje_camara(frame, msg, (0, 0, 180), 3000)
+                            break
+                        
+                elif fase_login == "RETOS":
                     reto = retos_actuales[paso_reto]
-
-                    put_texto_grande(frame, f"PASO {paso_reto+1}/{len(retos_actuales)}:",
-                                     110, color=(255, 200, 0))
+                    put_texto_grande(frame, f"PASO {paso_reto+1}/{len(retos_actuales)}:", 110, color=(255, 200, 0))
                     put_texto_grande(frame, reto["label"], 155, color=(0, 255, 0))
                     if reto["arrow"]:
                         draw_arrow(frame, reto["arrow"])
+                    if "id_punto" in reto:
+                        dibujar_objetivo_tactil(frame, face_lm, reto["id_punto"])
 
-                    # Verificar que la identidad no decaiga durante el reto
-                    # PAUSAR IDENTIDAD si el reto es 'manos' y hay una mano detectada,
-                    # para evitar que la oclusión distorsione el Face Mesh.
-                    ignorar_identidad = (reto["id"] == "manos" and res_hands.multi_hand_landmarks is not None)
+                    condiciones = reto["cond"]
+                    # 2. VALIDACIÓN NEGATIVA (El Bloqueo)
+                    gestos_erroneos = ["giro_der", "giro_izq", "arriba", "abajo", "sonrisa"]
+                    for gesto in gestos_erroneos:
+                        if gesto not in condiciones and acciones[gesto]:
+                            errores_acumulados += 1
+                            put_texto_grande(frame, f"MOVIMIENTO INCORRECTO ({errores_acumulados}/{MAX_ERRORES_VIVACIDAD})", 200, (0,0,255), 0.6)
 
-                    if not ignorar_identidad and frontal and sim < SIMILITUD_GATE:
+                    # 3. Detectar Interferencia
+                    if acciones["interferencia"]:
+                        registrar_fallo(nombre)
+                        print("[ALERTA] Intento de bloqueo de cámara detectado.")
+                        mensaje_camara(frame, "SISTEMA BLOQUEADO: INTERFERENCIA", (0, 0, 200), 3000)
+                        cap.release()
+                        cv2.destroyAllWindows()
+                        return False, None
+
+                    # 4. Verificación de umbral de error
+                    if errores_acumulados >= MAX_ERRORES_VIVACIDAD:
+                        registrar_fallo(nombre)
+                        print("[SEGURIDAD] Demasiados errores de posición. Posible video detectado.")
+                        mensaje_camara(frame, "ERROR VIVACIDAD: ACCESO DENEGADO", (0, 0, 255), 3000)
+                        cap.release()
+                        cv2.destroyAllWindows()
+                        return False, None
+
+                    # Relajar chequeo de identidad. Si es reto táctil, ignorarlo por la sombra del dedo.
+                    ignorar_identidad = (reto["id"].startswith("toca_") and res_hands.multi_hand_landmarks is not None)
+                    sim = cosine_similarity(current_fp, fp_ref) if frontal else 0.0
+                    
+                    if not ignorar_identidad and frontal:
+                        mostrar_indicador_identidad(frame, sim, SIMILITUD_RELAJADA)
+
+                    if not ignorar_identidad and frontal and sim < SIMILITUD_RELAJADA:
                         frames_cumplidos = 0
-                        mensaje_camara(frame, "IDENTIDAD INCONSISTENTE — REINICIANDO",
-                                       (0, 0, 200), 1200)
+                        frames_fail_reto += 1
+                        mensaje_camara(frame, "IDENTIDAD DUDOSA — ABORTE O INTENTELO DE NUEVO", (0, 0, 200), 500)
+                        
+                        # Si otra persona intenta hacer el reto y falla repetidas veces la similitud relajada:
+                        if frames_fail_reto >= 90:  # ~3 intentos largos o ~3 segundos de fraude detectado
+                            registrar_fallo(nombre)
+                            mensaje_camara(frame, "FRAUDE DETECTADO DURANTE RETO", (0, 0, 200), 2000)
+                            break
                     else:
-                        # Si el reto requiere parpadear, usar detector de ciclo
+                        frames_fail_reto = 0
+                        
+                        # Progreso del reto activo
                         requiere_parpadeo = ("parpadeo" in reto["cond"])
-                        otras_condiciones = [c for c in reto["cond"] if c != "parpadeo"]
+                        otras_cond = [c for c in reto["cond"] if c != "parpadeo"]
+                        cumple_otras = all(acciones.get(c, False) for c in otras_cond)
 
-                        cumple_otras = all(acciones.get(c, False) for c in otras_condiciones)
+                        if cumple_otras:
+                            errores_acumulados = 0
 
                         if requiere_parpadeo:
-                            # Requiere parpadear (y posiblemente otras cosas, como sonreir)
                             if cumple_otras:
                                 ojo_cerrado = acciones.get("parpadeo", False)
                                 if blink_estado_seg == "abierto" and ojo_cerrado:
@@ -990,7 +1065,7 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                                     if ojo_cerrado:
                                         blink_frames_seg += 1
                                     else:
-                                        if blink_frames_seg >= 1:
+                                        if blink_frames_seg >= 3:
                                             frames_cumplidos = FRAMES_REQUERIDOS # Fuerza el avance
                                         blink_estado_seg = "abierto"
                             else:
@@ -1103,12 +1178,7 @@ def main():
             print("\nVerificando credenciales...")
             res_creds = verificar_credenciales(nombre, password)
             if not res_creds:
-                bloqueado = registrar_fallo(nombre)
-                if bloqueado:
-                    print(f"Bloqueado {COOLDOWN_SEGUNDOS}s por demasiados intentos.")
-                else:
-                    cnt = _intentos_fallidos.get(nombre, {}).get("count", 0)
-                    print(f"Credenciales incorrectas. Intentos restantes: {MAX_INTENTOS_LOGIN - cnt}")
+                print("Credenciales incorrectas. Intente nuevamente.")
                 continue
 
             print(f"Credenciales OK. Iniciando verificacion biometrica...")
