@@ -45,10 +45,11 @@ FRAMES_REQUERIDOS   = 10
 # ─────────────────────────────────────────────
 #  Umbrales de Identidad — v2 (CORREGIDOS)
 # ─────────────────────────────────────────────
-# Umbral subido: con 32 puntos se puede exigir mayor similitud sin penalizar
-# al usuario legítimo. Reduce falsos positivos (persona distinta aceptada).
-SIMILITUD_GATE      = 0.94   # Gate en tiempo real  (antes: 0.92 — insuficiente)
-SIMILITUD_GATE_DURO = 0.97   # Validación final     (antes: 0.96 — insuficiente)
+# Debido a que los humanos compartimos proporciones faciales parecidas, la similitud del
+# coseno suele estar por arriba del 95% incluso entre dos personas distintas.
+# Exigimos un 98% para el Gate en tiempo real y 99% para la validación final.
+SIMILITUD_GATE      = 0.978  # Gate en tiempo real
+SIMILITUD_GATE_DURO = 0.988  # Validación final estricta
 MAX_FRAMES_RECHAZO  = 25     # Frames de rechazo antes de contar un fallo
 
 # ─────────────────────────────────────────────
@@ -88,9 +89,14 @@ os.makedirs(MEDIA_DIR, exist_ok=True)
 #  Poses de Registro
 # ─────────────────────────────────────────────
 POSES_REGISTRO = [
-    {"id": "blink",   "label": "VIDA (1/2): CIERRE Y ABRA LOS OJOS",   "cant": 0, "cond": ["parpadeo"]},
-    {"id": "smile",   "label": "VIDA (2/2): SONRIA AMPLIAMENTE",         "cant": 0, "cond": ["sonrisa"]},
-    {"id": "frontal", "label": "POSICION (1/1): MIRA AL FRENTE",         "cant": 5, "cond": []},
+    {"id": "blink",   "label": "VIDA (1/3): CIERRE Y ABRA LOS OJOS",   "cant": 0, "cond": ["parpadeo"]},
+    {"id": "smile",   "label": "VIDA (2/3): SONRIA AMPLIAMENTE",         "cant": 0, "cond": ["sonrisa"]},
+    {"id": "giro",    "label": "VIDA (3/3): GIRE LA CABEZA A LA IZQ",   "cant": 0, "cond": ["giro_izq"], "arrow": "IZQUIERDA"},
+    {"id": "frontal", "label": "POSICION (1/5): MIRA AL FRENTE",         "cant": 5, "cond": []},
+    {"id": "izq",     "label": "POSICION (2/5): GIRA A LA IZQUIERDA",   "cant": 5, "cond": ["giro_izq"], "arrow": "IZQUIERDA"},
+    {"id": "der",     "label": "POSICION (3/5): GIRA A LA DERECHA",     "cant": 5, "cond": ["giro_der"], "arrow": "DERECHA"},
+    {"id": "arriba",  "label": "POSICION (4/5): MIRA HACIA ARRIBA",     "cant": 5, "cond": ["arriba"],   "arrow": "ARRIBA"},
+    {"id": "abajo",   "label": "POSICION (5/5): MIRA HACIA ABAJO",     "cant": 5, "cond": ["abajo"],    "arrow": "ABAJO"},
 ]
 
 # ─────────────────────────────────────────────
@@ -274,6 +280,10 @@ def calcular_borrosidad(frame):
 RETOS_VIVACIDAD = [
     {"id": "parpadeo",  "label": "PARPADEE AHORA",       "cond": "parpadeo",  "arrow": None},
     {"id": "sonrisa",   "label": "SONRIA AHORA",          "cond": "sonrisa",   "arrow": None},
+    {"id": "giro_izq",  "label": "GIRE A LA IZQUIERDA",  "cond": "giro_izq",  "arrow": "IZQUIERDA"},
+    {"id": "giro_der",  "label": "GIRE A LA DERECHA",    "cond": "giro_der",  "arrow": "DERECHA"},
+    {"id": "arriba",    "label": "MIRE HACIA ARRIBA",    "cond": "arriba",    "arrow": "ARRIBA"},
+    {"id": "abajo",     "label": "MIRE HACIA ABAJO",     "cond": "abajo",     "arrow": "ABAJO"},
 ]
 
 class AntiSpoofingActivo:
@@ -398,6 +408,7 @@ def detectar_acciones(face_landmarks, hand_landmarks=None):
     acciones = {
         "parpadeo": False, "sonrisa": False, "giro_der": False,
         "giro_izq": False, "arriba": False, "abajo": False,
+        "interferencia": False,
         "dedos": 0, "mano_zona": None
     }
     if not face_landmarks:
@@ -424,6 +435,14 @@ def detectar_acciones(face_landmarks, hand_landmarks=None):
 
     if hand_landmarks:
         acciones["dedos"] = contar_dedos(hand_landmarks.landmark)
+        # Reto anti-deepfake (manos sobre la cara)
+        h_x = hand_landmarks.landmark[0].x
+        f_izq = pts[234].x
+        f_der = pts[454].x
+        # Rango con 5% extra para ser flexibles
+        if min(f_izq, f_der) - 0.05 < h_x < max(f_izq, f_der) + 0.05:
+            if acciones["dedos"] >= 3:
+                acciones["interferencia"] = True
     return acciones
 
 # ─────────────────────────────────────────────
@@ -798,12 +817,16 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
         # Retos de seguridad: SOLO gestos faciales aleatorios.
         # Sin manos — evita confusión y ataques donde otra persona pone la mano.
         POOL_RETOS = [
-            {"label": "PARPADEE",               "cond": ["parpadeo"],            "arrow": None},
-            {"label": "SONRIA AMPLIO",           "cond": ["sonrisa"],             "arrow": None},
-            {"label": "SONRIA Y PARPADEE",      "cond": ["sonrisa", "parpadeo"], "arrow": None},
+            {"id": "parpadeo", "label": "PARPADEE",               "cond": ["parpadeo"],            "arrow": None},
+            {"id": "sonrisa",  "label": "SONRIA AMPLIO",          "cond": ["sonrisa"],             "arrow": None},
+            {"id": "manos",    "label": "PASE 3 DEDOS SOBRE SU CARA", "cond": ["interferencia"],   "arrow": None},
+            {"id": "giro_izq", "label": "GIRE A LA IZQUIERDA",    "cond": ["giro_izq"],            "arrow": "IZQUIERDA"},
+            {"id": "giro_der", "label": "GIRE A LA DERECHA",      "cond": ["giro_der"],            "arrow": "DERECHA"},
+            {"id": "arriba",   "label": "MIRE HACIA ARRIBA",      "cond": ["arriba"],              "arrow": "ARRIBA"},
+            {"id": "abajo",    "label": "MIRE HACIA ABAJO",       "cond": ["abajo"],               "arrow": "ABAJO"},
         ]
 
-        retos_actuales   = random.sample(POOL_RETOS, 2)
+        retos_actuales   = random.sample(POOL_RETOS, 3)
         paso_reto        = 0
         frames_cumplidos = 0
         frames_fail_id   = 0
@@ -941,7 +964,11 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                         draw_arrow(frame, reto["arrow"])
 
                     # Verificar que la identidad no decaiga durante el reto
-                    if frontal and sim < SIMILITUD_GATE:
+                    # PAUSAR IDENTIDAD si el reto es 'manos' y hay una mano detectada,
+                    # para evitar que la oclusión distorsione el Face Mesh.
+                    ignorar_identidad = (reto["id"] == "manos" and res_hands.multi_hand_landmarks is not None)
+
+                    if not ignorar_identidad and frontal and sim < SIMILITUD_GATE:
                         frames_cumplidos = 0
                         mensaje_camara(frame, "IDENTIDAD INCONSISTENTE — REINICIANDO",
                                        (0, 0, 200), 1200)
