@@ -562,15 +562,22 @@ def mostrar_progreso(frame, paso, total, subpaso_prog=0):
     cv2.putText(frame, f"PASO {paso+1} DE {total}", (55, h-45),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-def mensaje_camara(frame, texto, color, duracion_ms=2000):
+def mensaje_camara(frame, texto, color, duracion_ms=2000, cap=None):
     h, w = frame.shape[:2]
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, h//2-60), (w, h//2+60), color, -1)
     cv2.addWeighted(overlay, 0.8, frame, 0.2, 0, frame)
-    cv2.putText(frame, texto, (w//2 - len(texto)*10, h//2 + 15),
+    cv2.putText(frame, texto, (max(10, w//2 - len(texto)*10), h//2 + 15),
                 cv2.FONT_HERSHEY_DUPLEX, 0.9, (255, 255, 255), 2)
     cv2.imshow("StarPulse Ultra", frame)
-    cv2.waitKey(duracion_ms)
+    
+    if cap is not None:
+        start = time.time()
+        while (time.time() - start) * 1000 < duracion_ms:
+            cap.grab()  # Vaciar buffer de cámara durante la pausa
+            cv2.waitKey(1)
+    else:
+        cv2.waitKey(duracion_ms)
 
 def mostrar_indicador_identidad(frame, sim, gate):
     h, w   = frame.shape[:2]
@@ -1016,6 +1023,19 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                     tiempo_rest_seg = max(0, (150 - frames_en_este_reto) // 30)
                     put_texto_grande(frame, f"PASO {paso_reto+1}/{len(retos_actuales)} ({tiempo_rest_seg}s):", 110, color=(255, 200, 0))
                     put_texto_grande(frame, reto["label"], 155, color=(0, 255, 0))
+                    
+                    # Barra de tiempo descendente
+                    hb, wb = frame.shape[:2]
+                    bx0, by0 = wb - 230, 105
+                    bx1, by1 = wb - 20, 127
+                    cv2.rectangle(frame, (bx0, by0), (bx1, by1), (50, 50, 50), -1)
+                    pct = max(0, 150 - frames_en_este_reto) / 150
+                    fill = int((bx1 - bx0) * pct)
+                    c_bar = (0, 255, 255) if pct > 0.4 else (0, 100, 255)
+                    cv2.rectangle(frame, (bx0, by0), (bx0 + fill, by1), c_bar, -1)
+                    cv2.rectangle(frame, (bx0, by0), (bx1, by1), (180, 180, 180), 1)
+                    cv2.putText(frame, "TIEMPO LIMITE", (bx0, by0 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.44, c_bar, 1)
+
                     if reto["arrow"]:
                         draw_arrow(frame, reto["arrow"])
                     if "id_punto" in reto:
@@ -1039,11 +1059,14 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                     condiciones = reto["cond"]
                     # 2. VALIDACIÓN NEGATIVA ESTRICTA (El Bloqueo)
                     gestos_erroneos = ["giro_der", "giro_izq", "arriba", "abajo", "sonrisa", "parpadeo"]
-                    for gesto in gestos_erroneos:
-                        if gesto not in condiciones and acciones.get(gesto, False):
-                            errores_acumulados += 1
-                            put_texto_grande(frame, f"MOVIMIENTO INCORRECTO ({errores_acumulados}/{MAX_ERRORES_VIVACIDAD})", 200, (0,0,255), 0.6)
-                            break # Solo sumar 1 error por frame
+                    if frames_en_este_reto > 30: # 1 s de gracia para reaccionar al inicio o tras un error
+                        for gesto in gestos_erroneos:
+                            if gesto not in condiciones and acciones.get(gesto, False):
+                                errores_acumulados += 1
+                                put_texto_grande(frame, f"MOVIMIENTO INCORRECTO ({errores_acumulados}/{MAX_ERRORES_VIVACIDAD})", 200, (0,0,255), 0.6)
+                                break # Solo sumar 1 error por frame
+                    else:
+                        errores_acumulados = 0
 
                     # 3. Detectar Interferencia
                     if acciones["interferencia"]:
@@ -1071,12 +1094,12 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                         
                         if is_locked:
                             print("[SEGURIDAD] Demasiados errores de posición. Posible video detectado.")
-                            mensaje_camara(frame, "ERROR VIVACIDAD: ACCESO DENEGADO", (0, 0, 255), 3000)
+                            mensaje_camara(frame, "ERROR VIVACIDAD: ACCESO DENEGADO", (0, 0, 255), 3000, cap=cap)
                             cap.release()
                             cv2.destroyAllWindows()
                             return False, None
                         else:
-                            mensaje_camara(frame, f"MOVIMIENTO INVALIDO - {intentos_rest} INTENTOS REST", (0, 0, 255), 2000)
+                            mensaje_camara(frame, f"MOVIMIENTO INVALIDO - {intentos_rest} INTENTOS REST", (0, 0, 255), 2000, cap=cap)
                             continue
 
                     # Relajar chequeo de identidad. Si es reto táctil, ignorarlo por la sombra del dedo.
