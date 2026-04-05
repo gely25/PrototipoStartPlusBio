@@ -1,0 +1,18 @@
+# ─────────────────────────────────────────────
+#  Dependencias Principales - StarPulse Ultra
+# ─────────────────────────────────────────────
+
+# Servidor API y base de datos
+flask>=3.0.0
+
+# Visión artificial y acceso a cámara
+opencv-python>=4.8.0
+
+# Inteligencia Artificial (Malla facial y manos)
+mediapipe>=0.10.0
+
+# Procesamiento matemático de vectores biométricos
+numpy>=1.24.0
+
+# Comunicación Cliente-Servidor (HTTP)
+requests>=2.31.0
