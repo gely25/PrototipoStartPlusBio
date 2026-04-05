@@ -309,10 +309,10 @@ UMBRAL_PROXIMIDAD = 0.05 # Distancia de proximidad entre dedo y cara (normalizad
 
 # Puntos de la cara (MediaPipe Indices)
 PUNTOS_CARA = {
-    "forehead": {"id": 10, "label": "LA FRENTE"},
-    "nose": {"id": 1, "label": "LA PUNTA DE LA NARIZ"},
-    "cheek_right": {"id": 234, "label": "SU MEJILLA DERECHA"},
-    "cheek_left": {"id": 454, "label": "SU MEJILLA IZQUIERDA"}
+    "forehead": {"id": 10, "label": "TOQUE LA FRENTE CON SU DEDO INDICE"},
+    "nose": {"id": 1, "label": "TOQUE SU NARIZ CON SU DEDO INDICE"},
+    "cheek_right": {"id": 234, "label": "TOQUE LA MEJILLA DERECHA CON EL INDICE"},
+    "cheek_left": {"id": 454, "label": "TOQUE LA MEJILLA IZQ CON EL INDICE"}
 }
 
 class AntiSpoofingActivo:
@@ -438,8 +438,9 @@ def detectar_acciones(face_landmarks, hand_landmarks=None):
 
     if hand_landmarks:
         acciones["dedos"] = contar_dedos(hand_landmarks.landmark)
-        if acciones["dedos"] >= 3:
-            acciones["interferencia"] = True
+        # Deshabilitado por UX: interfiere falsamente si la mano se acerca a la cara
+        # if acciones["dedos"] >= 3:
+        #     acciones["interferencia"] = True
             
         # Puntero: Dedo Índice (Landmark 8)
         dedo_x = hand_landmarks.landmark[8].x
@@ -518,9 +519,10 @@ def dibujar_objetivo_tactil(frame, face_lm, id_punto):
     cx, cy = int(pt.x * w), int(pt.y * h)
     
     # Dibujar un círculo donde el usuario debe poner el dedo
-    cv2.circle(frame, (cx, cy), 20, (0, 255, 255), 2)
-    cv2.putText(frame, "PONGA SU DEDO AQUI", (cx + 25, cy), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+    cv2.circle(frame, (cx, cy), 15, (0, 0, 255), -1)
+    cv2.circle(frame, (cx, cy), 35, (0, 255, 255), 3)
+    cv2.putText(frame, "<- INDICE AQUI", (cx + 45, cy + 5), 
+                cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 255), 2)
 
 def cuenta_regresiva(cap, mensaje, segundos=3):
     start = time.time()
@@ -659,11 +661,12 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                     condiciones = pose["cond"]
                     cumple_pose= all(acciones[c] for c in condiciones)
 
-                    # 2. VALIDACIÓN NEGATIVA (Sin bloqueo durante el registro)
-                    gestos_erroneos = ["giro_der", "giro_izq", "arriba", "abajo", "sonrisa"]
+                    # 2. VALIDACIÓN NEGATIVA ESTRICTA (Sin bloqueo durante el registro)
+                    gestos_erroneos = ["giro_der", "giro_izq", "arriba", "abajo", "sonrisa", "parpadeo"]
                     for gesto in gestos_erroneos:
-                        if gesto not in condiciones and acciones[gesto]:
+                        if gesto not in condiciones and acciones.get(gesto, False):
                             put_texto_grande(frame, "MOVIMIENTO INCORRECTO", 100, (0,0,255), 0.6)
+                            break
 
                     # 3. Interferencia (Solo advertencia visual en registro)
                     if acciones["interferencia"]:
@@ -936,18 +939,25 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                 if not spoof_ok:
                     # Mostrar el reto en pantalla de forma prominente
                     put_texto_grande(frame, "PRUEBA DE VIVACIDAD:", 110, color=(255, 200, 0))
-                    put_texto_grande(frame, f"TOQUE {anti_spoof.datos_punto['label']} CON SU DEDO",
+                    put_texto_grande(frame, anti_spoof.datos_punto['label'],
                                      155, color=(0, 255, 255))
                     
                     dibujar_objetivo_tactil(frame, face_lm, anti_spoof.datos_punto["id"])
 
                     # Timeout: reiniciar con reto nuevo
                     if anti_spoof.tiempo_restante <= 0:
-                        put_texto_grande(frame, "TIEMPO AGOTADO — INTENTE DE NUEVO",
-                                         200, color=(0, 50, 255))
-                        cv2.imshow("StarPulse Ultra", frame)
-                        cv2.waitKey(2000)
-                        anti_spoof.reset()  # sortea nuevo reto
+                        registrar_fallo(nombre)
+                        fail_count = _intentos_fallidos[nombre]["count"]
+                        intentos_rest = MAX_INTENTOS_LOGIN - fail_count
+                        
+                        if fail_count >= MAX_INTENTOS_LOGIN:
+                            mensaje_camara(frame, f"SISTEMA BLOQUEADO ({COOLDOWN_SEGUNDOS}s)", (0, 0, 255), 3000)
+                            cap.release()
+                            cv2.destroyAllWindows()
+                            return False, None
+                        else:
+                            mensaje_camara(frame, f"TIEMPO AGOTADO - {intentos_rest} INTENTOS REST", (0, 100, 255), 2000)
+                            anti_spoof.reset()  # sortea nuevo reto
 
                     cv2.imshow("StarPulse Ultra", frame)
                     cv2.waitKey(1)
@@ -987,8 +997,12 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                                          155, color=(80, 80, 255), escala=0.60)
 
                         if frames_fail_id >= MAX_FRAMES_RECHAZO:
-                            bloqueado = registrar_fallo(nombre)
-                            msg = f"BLOQUEADO {COOLDOWN_SEGUNDOS}s" if bloqueado else "ACCESO DENEGADO"
+                            registrar_fallo(nombre)
+                            fail_count = _intentos_fallidos[nombre]["count"]
+                            intentos_rest = MAX_INTENTOS_LOGIN - fail_count
+                            msg = (f"BLOQUEADO {COOLDOWN_SEGUNDOS}s" 
+                                   if fail_count >= MAX_INTENTOS_LOGIN
+                                   else f"ACCESO DENEGADO - {intentos_rest} INTENTOS REST")
                             mensaje_camara(frame, msg, (0, 0, 180), 3000)
                             break
                         
@@ -1002,30 +1016,46 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                         dibujar_objetivo_tactil(frame, face_lm, reto["id_punto"])
 
                     condiciones = reto["cond"]
-                    # 2. VALIDACIÓN NEGATIVA (El Bloqueo)
-                    gestos_erroneos = ["giro_der", "giro_izq", "arriba", "abajo", "sonrisa"]
+                    # 2. VALIDACIÓN NEGATIVA ESTRICTA (El Bloqueo)
+                    gestos_erroneos = ["giro_der", "giro_izq", "arriba", "abajo", "sonrisa", "parpadeo"]
                     for gesto in gestos_erroneos:
-                        if gesto not in condiciones and acciones[gesto]:
+                        if gesto not in condiciones and acciones.get(gesto, False):
                             errores_acumulados += 1
                             put_texto_grande(frame, f"MOVIMIENTO INCORRECTO ({errores_acumulados}/{MAX_ERRORES_VIVACIDAD})", 200, (0,0,255), 0.6)
+                            break # Solo sumar 1 error por frame
 
                     # 3. Detectar Interferencia
                     if acciones["interferencia"]:
                         registrar_fallo(nombre)
-                        print("[ALERTA] Intento de bloqueo de cámara detectado.")
-                        mensaje_camara(frame, "SISTEMA BLOQUEADO: INTERFERENCIA", (0, 0, 200), 3000)
-                        cap.release()
-                        cv2.destroyAllWindows()
-                        return False, None
+                        fail_count = _intentos_fallidos[nombre]["count"]
+                        intentos_rest = MAX_INTENTOS_LOGIN - fail_count
+                        
+                        if fail_count >= MAX_INTENTOS_LOGIN:
+                            print("[ALERTA] Intento de bloqueo de cámara detectado.")
+                            mensaje_camara(frame, "SISTEMA BLOQUEADO: INTERFERENCIA", (0, 0, 200), 3000)
+                            cap.release()
+                            cv2.destroyAllWindows()
+                            return False, None
+                        else:
+                            mensaje_camara(frame, f"CAMARA OCLUIDA - {intentos_rest} INTENTOS REST", (0, 100, 255), 1500)
 
                     # 4. Verificación de umbral de error
                     if errores_acumulados >= MAX_ERRORES_VIVACIDAD:
+                        errores_acumulados = 0
+                        frames_cumplidos = 0
                         registrar_fallo(nombre)
-                        print("[SEGURIDAD] Demasiados errores de posición. Posible video detectado.")
-                        mensaje_camara(frame, "ERROR VIVACIDAD: ACCESO DENEGADO", (0, 0, 255), 3000)
-                        cap.release()
-                        cv2.destroyAllWindows()
-                        return False, None
+                        fail_count = _intentos_fallidos[nombre]["count"]
+                        intentos_rest = MAX_INTENTOS_LOGIN - fail_count
+                        
+                        if fail_count >= MAX_INTENTOS_LOGIN:
+                            print("[SEGURIDAD] Demasiados errores de posición. Posible video detectado.")
+                            mensaje_camara(frame, "ERROR VIVACIDAD: ACCESO DENEGADO", (0, 0, 255), 3000)
+                            cap.release()
+                            cv2.destroyAllWindows()
+                            return False, None
+                        else:
+                            mensaje_camara(frame, f"MOVIMIENTO INVALIDO - {intentos_rest} INTENTOS REST", (0, 0, 255), 2000)
+                            continue
 
                     # Relajar chequeo de identidad. Si es reto táctil, ignorarlo por la sombra del dedo.
                     ignorar_identidad = (reto["id"].startswith("toca_") and res_hands.multi_hand_landmarks is not None)
@@ -1042,7 +1072,12 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                         # Si otra persona intenta hacer el reto y falla repetidas veces la similitud relajada:
                         if frames_fail_reto >= 90:  # ~3 intentos largos o ~3 segundos de fraude detectado
                             registrar_fallo(nombre)
-                            mensaje_camara(frame, "FRAUDE DETECTADO DURANTE RETO", (0, 0, 200), 2000)
+                            fail_count = _intentos_fallidos[nombre]["count"]
+                            intentos_rest = MAX_INTENTOS_LOGIN - fail_count
+                            if fail_count >= MAX_INTENTOS_LOGIN:
+                                mensaje_camara(frame, f"SISTEMA BLOQUEADO ({COOLDOWN_SEGUNDOS}s)", (0, 0, 200), 3000)
+                            else:
+                                mensaje_camara(frame, f"FRAUDE DETECTADO - {intentos_rest} INTENTOS REST", (0, 0, 200), 2000)
                             break
                     else:
                         frames_fail_reto = 0
@@ -1052,8 +1087,9 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                         otras_cond = [c for c in reto["cond"] if c != "parpadeo"]
                         cumple_otras = all(acciones.get(c, False) for c in otras_cond)
 
-                        if cumple_otras:
-                            errores_acumulados = 0
+                        # La penalización NO se reinicia (errores_acumulados se mantiene).
+                        # if cumple_otras:
+                        #     errores_acumulados = 0
 
                         if requiere_parpadeo:
                             if cumple_otras:
@@ -1098,10 +1134,12 @@ def flujo_biometrico(modo, nombre, fingerprint_esperado=None):
                                                (0, 200, 0), 2500)
                                 exito_final = True
                             else:
-                                bloqueado = registrar_fallo(nombre)
-                                msg = ("DEMASIADOS INTENTOS — ESPERE"
-                                       if bloqueado
-                                       else "VERIFICACION FALLIDA")
+                                registrar_fallo(nombre)
+                                fail_count = _intentos_fallidos[nombre]["count"]
+                                intentos_rest = MAX_INTENTOS_LOGIN - fail_count
+                                msg = (f"BLOQUEADO {COOLDOWN_SEGUNDOS}s"
+                                       if fail_count >= MAX_INTENTOS_LOGIN
+                                       else f"FALLIDO - {intentos_rest} INTENTOS REST")
                                 print(f" DENEGADO: sim final {sim_final*100:.2f}%")
                                 mensaje_camara(frame, msg, (0, 0, 200), 3000)
                                 exito_final = False
